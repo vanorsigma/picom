@@ -384,8 +384,16 @@ struct server_data *server_init(session_t *ps) {
 		// Extract display number from ":N" or "host:N"
 		const char *display_num = display;
 		while (*display_num && *display_num != ':') display_num++;
-		if (!*display_num) display_num = display;
-		scoped_charp path = NULL;
+		if (*display_num == ':') {
+			display_num++;    // skip the ':'
+		} else if (!*display_num) {
+			display_num = display;
+		}
+		// Plain char *: ownership is transferred to ps->o.shader_server_socket,
+		// which is freed in options cleanup / server_destroy. Using scoped_charp
+		// here would free the buffer at end of this block, leaving sock_path
+		// dangling and causing bind() to create a garbage-named socket in cwd.
+		char *path;
 		if (runtime_dir) {
 			size_t len = strlen(runtime_dir) + 12;
 			path = ccalloc(len, char);
@@ -395,7 +403,6 @@ struct server_data *server_init(session_t *ps) {
 			path = ccalloc(len, char);
 			snprintf(path, len, "/tmp/picom-%s.sock", display_num);
 		}
-		// Store on options so it's freed later
 		free(ps->o.shader_server_socket);
 		ps->o.shader_server_socket = path;
 		sock_path = ps->o.shader_server_socket;
