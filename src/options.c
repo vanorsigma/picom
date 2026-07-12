@@ -541,9 +541,13 @@ static const struct picom_option picom_options[] = {
     // Options that are too long to fit in one line
     [321] = {"log-level"  , PARSE_WITH(string_to_log_level, LOG_LEVEL_INVALID, log_level),
              "Log level, possible values are: trace, debug, info, warn, error"},
-    [328] = {"blur-method", PARSE_WITH(parse_blur_method, BLUR_METHOD_INVALID, blur_method),
+     [328] = {"blur-method", PARSE_WITH(parse_blur_method, BLUR_METHOD_INVALID, blur_method),
              "The algorithm used for background bluring. Available choices are: 'none' to disable, 'gaussian', "
 	     "'box' or 'kernel' for custom convolution blur with --blur-kern."},
+
+    // Shader server / folder shaders
+    [400] = {"shader-directory"           , STRING(shader_directory)                           , "Path to a directory of .glsl/.frag files to load as folder shaders."},
+    [401] = {"shader-server-socket"       , STRING(shader_server_socket)                       , "Path to the Unix domain socket for runtime shader control. (default: /run/user/$UID/picom.sock)"},
 
     // Deprecated options
     [269] = {"refresh-rate"       , WARN_DEPRECATED(IGNORE(required_argument))},
@@ -984,6 +988,8 @@ void options_destroy(struct options *options) {
 	free(options->logpath);
 	free(options->window_shader_fg);
 	free(options->root_pixmap_shader);
+	free(options->shader_directory);
+	free(options->shader_server_socket);
 
 	for (int i = 0; i < options->blur_kernel_count; ++i) {
 		free(options->blur_kerns[i]);

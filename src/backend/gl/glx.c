@@ -521,6 +521,7 @@ const struct backend_operations glx_ops = {
     .is_format_supported = gl_is_format_supported,
     .new_image = gl_new_image,
     .present = glx_present,
+    .post_process = gl_post_process,
     .quirks = backend_no_quirks,
     .version = glx_version,
     .release_image = gl_release_image,

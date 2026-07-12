@@ -12,6 +12,7 @@
 #define CASESTRRET(s)                                                                    \
 	case s: return #s
 struct gl_blur_context;
+struct shader_input_var;
 
 // Fragment shader uniforms
 #define UNIFORM_OPACITY_LOC 1
@@ -180,6 +181,15 @@ void gl_destroy_blur_context(backend_t *base, void *ctx);
 void gl_get_blur_size(void *blur_context, int *width, int *height);
 
 enum device_status gl_device_status(backend_t *base);
+
+/// Collect custom uniforms from a compiled shader (those at locations >= NUMBER_OF_UNIFORMS)
+void gl_collect_custom_uniforms(struct gl_shader *sh, struct shader_input_var **out);
+
+/// Apply display-wide post-processing shaders to the composited output
+void gl_post_process(backend_t *base, image_handle target, ivec2 size,
+                     const region_t *damage,
+                     struct shader_folder_entry *entries,
+                     struct shader_state_value *state);
 
 #define gl_check_fb_complete(fb) gl_check_fb_complete_(__func__, __LINE__, (fb))
 static inline bool gl_check_fb_complete_(const char *func, int line, GLenum fb);

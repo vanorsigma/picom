@@ -451,6 +451,10 @@ typedef struct options {
 	struct shader_specification *root_pixmap_shader;
 	/// Custom fragment shader for painting windows
 	struct shader_specification *window_shader_fg;
+	/// Path to a directory of .glsl/.frag files to load as folder shaders
+	char *shader_directory;
+	/// Path to the Unix domain socket for runtime shader control
+	char *shader_server_socket;
 	/// Rules to change custom fragment shader for painting windows.
 	struct list_node window_shader_fg_rules;
 	/// How much to dim an inactive window. 0.0 - 1.0, 0 to disable.

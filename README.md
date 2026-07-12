@@ -1,6 +1,34 @@
 picom
 =====
 
+# This Fork
+
+OpenGL & picom code is hard and I'm stupid, so this was done mostly with the help of AI.
+
+I've at least read through the code and it makes some sense, but the finer details (e.g. `glBindSampler(1, gd->samplers[GL_SAMPLER_BORDER])` vs `glBindSampler(1, gd->samplers[GL_SAMPLER_REPEAT])`) is completely lost on me.
+
+The changes essentially inserts a new stage  _before_ monitor repainting, applying shaders to the whole screen.
+
+It does the following:
+- Load shaders from a directory, with them **disabled** by default (`--shader-directory`).
+- Togglable shaders via a Unix socket:
+
+    ``` bash
+    picom-ctl() { echo "$@" | nc -U /tmp/picom.sock };
+    picom-ctl "ENABLE <shader name>"
+    picom-ctl "DISABLE <shader name>"
+    picom-ctl "LIST <shader name>"
+    ```
+- New flags to start aforementioned Unix Socket, `--shader-server-socket`
+
+Didn't want to use DBus for my usecases.
+
+See `testingshaders/` for the shaders I used to test the changes.
+
+I will try to keep this fork up-to-date to main, since I also want to use the `egl` renderer, which isn't available on Debian 13 default repos.
+
+# Original README
+
 [![circleci](https://circleci.com/gh/yshui/picom.svg?style=shield)](https://circleci.com/gh/yshui/picom)
 [![codecov](https://codecov.io/gh/yshui/picom/branch/next/graph/badge.svg?token=NRSegi0Gze)](https://codecov.io/gh/yshui/picom)
 [![chat on discord](https://img.shields.io/discord/1106224720833159198?logo=discord)](https://discord.gg/SY5JJzPgME)

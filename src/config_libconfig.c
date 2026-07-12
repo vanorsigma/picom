@@ -1240,6 +1240,22 @@ bool parse_config_libconfig(options_t *opt, const char *config_file) { /*NOLINT(
 		}
 	}
 
+	// --shader-directory
+	{
+		const char *v = NULL;
+		if (config_lookup_string(&cfg, "shader-directory", &v)) {
+			opt->shader_directory = strdup(v);
+		}
+	}
+
+	// --shader-server-socket
+	{
+		const char *v = NULL;
+		if (config_lookup_string(&cfg, "shader-server-socket", &v)) {
+			opt->shader_server_socket = strdup(v);
+		}
+	}
+
 	// --xrender-sync-fence
 	lcfg_lookup_bool(&cfg, "xrender-sync-fence", &opt->xrender_sync_fence);
 

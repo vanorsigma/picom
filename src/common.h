@@ -56,6 +56,7 @@
 // === Types ===
 struct atom;
 struct conv;
+struct server_data;
 
 struct shader_source {
 	const char *path;
@@ -68,6 +69,43 @@ struct shader_info {
 	const char *source;
 	shader_handle backend_shader;
 	uint64_t attributes;
+	UT_hash_handle hh;
+};
+
+enum shader_uniform_type {
+	SU_FLOAT,
+	SU_INT,
+	SU_VEC2,
+	SU_VEC3,
+	SU_VEC4,
+	SU_BOOL,
+};
+
+struct shader_input_var {
+	char *name;
+	enum shader_uniform_type type;
+	int gl_type;
+	int location;
+	UT_hash_handle hh;
+};
+
+struct shader_folder_entry {
+	char *name;
+	struct shader_info *info;
+	struct shader_input_var *vars;
+	bool enabled;
+	unsigned order;
+	UT_hash_handle hh;
+};
+
+struct shader_state_value {
+	char *key;
+	enum shader_uniform_type type;
+	union {
+		float f;
+		int i;
+		float v[4];
+	};
 	UT_hash_handle hh;
 };
 
@@ -204,6 +242,11 @@ typedef struct session {
 	// === DBus related ===
 	struct cdbus_data *dbus_data;
 #endif
+
+	// === Shader server / folder shaders ===
+	struct shader_folder_entry *shader_folder_entries;
+	struct shader_state_value *shader_state;
+	struct server_data *shader_server;
 } session_t;
 
 struct wintype_info {

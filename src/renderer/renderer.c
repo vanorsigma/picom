@@ -538,6 +538,16 @@ bool renderer_render(struct renderer *r, struct backend_base *backend,
 		return false;
 	}
 
+	// Apply display-wide post-processing shaders
+#ifdef CONFIG_SERVER
+	if (backend->ops.post_process && ps_g->shader_folder_entries) {
+		backend->ops.post_process(backend, r->back_image, r->canvas_size,
+		                          &damage_region,
+		                          ps_g->shader_folder_entries,
+		                          ps_g->shader_state);
+	}
+#endif
+
 	if (monitor_repaint) {
 		// Keep a copy of un-tainted back image
 		backend->ops.copy_area(backend, (ivec2){},
@@ -558,8 +568,36 @@ bool renderer_render(struct renderer *r, struct backend_base *backend,
 		backend->ops.blit(backend, (ivec2){}, r->back_image, &blit);
 	}
 
+	// When post-processing shaders are active, copy the full screen to ensure
+	// the shader output reaches every pixel of every swap chain buffer
+#ifdef CONFIG_SERVER
+	bool present_use_full = false;
+	if (backend->ops.post_process && ps_g->shader_folder_entries) {
+		struct shader_folder_entry *fe, *ftmp;
+		HASH_ITER(hh, ps_g->shader_folder_entries, fe, ftmp) {
+			if (fe->enabled && fe->info && fe->info->backend_shader) {
+				present_use_full = true;
+				break;
+			}
+		}
+	}
+#else
+	bool present_use_full = false;
+#endif
+
+	region_t present_region;
+	if (present_use_full) {
+		pixman_region32_init_rect(&present_region, 0, 0,
+		                          (unsigned)r->canvas_size.width,
+		                          (unsigned)r->canvas_size.height);
+	} else {
+		pixman_region32_init(&present_region);
+		pixman_region32_copy(&present_region, &damage_region);
+	}
+
 	backend->ops.copy_area_quantize(backend, (ivec2){}, backend->ops.back_buffer(backend),
-	                                r->back_image, &damage_region);
+	                                r->back_image, &present_region);
+	pixman_region32_fini(&present_region);
 
 	if (global_debug_options.consistent_buffer_age) {
 		region_t region;

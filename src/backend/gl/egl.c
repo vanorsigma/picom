@@ -365,6 +365,7 @@ const struct backend_operations egl_ops = {
     .image_capabilities = gl_image_capabilities,
     .new_image = gl_new_image,
     .present = egl_present,
+    .post_process = gl_post_process,
     .quirks = backend_no_quirks,
     .version = egl_version,
     .release_image = gl_release_image,

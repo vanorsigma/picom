@@ -9,6 +9,7 @@ option('compton', type: 'boolean', value: true, description: 'Install backwards 
 option('with_docs', type: 'boolean', value: false, description: 'Build documentation and man pages')
 
 option('unittest', type: 'boolean', value: false, description: 'Enable unittests in the code')
+option('server', type: 'boolean', value: true, description: 'Enable shader server socket for runtime control')
 
 # Experimental options
 

@@ -815,9 +815,324 @@ static inline void gl_init_uniform_bitmask(struct gl_shader *shader) {
 		char name[32];
 		glGetActiveUniformName(shader->prog, (GLuint)i, sizeof(name), NULL, name);
 		GLint loc = glGetUniformLocation(shader->prog, name);
-		assert(loc >= 0 && loc < NUMBER_OF_UNIFORMS);
-		shader->uniform_bitmask |= 1U << loc;
+		assert(loc >= 0);
+		if (loc < NUMBER_OF_UNIFORMS) {
+			shader->uniform_bitmask |= 1U << loc;
+		}
 	}
+}
+
+void gl_collect_custom_uniforms(struct gl_shader *sh, struct shader_input_var **out) {
+	GLint n = 0;
+	glGetProgramiv(sh->prog, GL_ACTIVE_UNIFORMS, &n);
+	for (int i = 0; i < n; i++) {
+		char name[256];
+		GLsizei len;
+		GLenum type;
+		GLint size;
+		glGetActiveUniform(sh->prog, (GLuint)i, sizeof(name), &len, &size, &type, name);
+		GLint loc = glGetUniformLocation(sh->prog, name);
+		if (loc < NUMBER_OF_UNIFORMS) {
+			continue; // built-in, skip
+		}
+		// Strip array suffix "[0]" if present
+		char *array_suffix = strstr(name, "[0]");
+		if (array_suffix) {
+			*array_suffix = '\0';
+		}
+		auto v = ccalloc(1, struct shader_input_var);
+		v->name = strdup(name);
+		v->gl_type = (int)type;
+		v->location = loc;
+		// Map GL type to our uniform type enum
+		switch (type) {
+		case GL_FLOAT:      v->type = SU_FLOAT; break;
+		case GL_INT:        v->type = SU_INT; break;
+		case GL_BOOL:       v->type = SU_BOOL; break;
+		case GL_FLOAT_VEC2: v->type = SU_VEC2; break;
+		case GL_FLOAT_VEC3: v->type = SU_VEC3; break;
+		case GL_FLOAT_VEC4: v->type = SU_VEC4; break;
+		default:
+			log_warn("Unknown uniform type %#x for %s, ignoring", type, name);
+			free(v->name);
+			free(v);
+			continue;
+		}
+		HASH_ADD_STR(*out, name, v);
+	}
+}
+
+void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
+                     const region_t *damage attr_unused,
+                     struct shader_folder_entry *entries,
+                     struct shader_state_value *state) {
+	auto gd = (struct gl_data *)base;
+
+	// Check if there is anything to do
+	if (!entries) {
+		return;
+	}
+	bool has_enabled = false;
+	struct shader_folder_entry *fe, *ftmp;
+	HASH_ITER(hh, entries, fe, ftmp) {
+		if (fe->enabled && fe->info && fe->info->backend_shader) {
+			has_enabled = true;
+			break;
+		}
+	}
+	if (!has_enabled) {
+		return;
+	}
+
+	auto target = (struct gl_texture *)target_handle;
+	int w = size.width;
+	int h = size.height;
+	if (w <= 0 || h <= 0) {
+		return;
+	}
+
+	// Allocate/lookup ping-pong textures on the target image's auxiliary texture
+	// slots. We use auxiliary_texture[0] and [1] as our ping-pong buffers.
+	if (!target->auxiliary_texture[0]) {
+		target->auxiliary_texture[0] = gl_new_texture();
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, target->auxiliary_texture[0]);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	}
+	if (!target->auxiliary_texture[1]) {
+		target->auxiliary_texture[1] = gl_new_texture();
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, target->auxiliary_texture[1]);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	}
+
+	// Set up full-screen quad coordinates
+	rect_t full_rect = {0, 0, w, h};
+	GLfloat *coord = ccalloc(16, GLfloat);
+	GLuint *indices = ccalloc(6, GLuint);
+	gl_mask_rects_to_coords_simple(1, &full_rect, coord, indices);
+
+	// Flip target Y if the target is y-inverted
+	if (target->y_inverted) {
+		gl_y_flip_target(1, coord, (GLint)h);
+	}
+
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	float time_ms = (float)ts.tv_sec * 1000.0F + (float)ts.tv_nsec / 1.0e6F;
+
+	int current = 0;
+	struct gl_texture src_tex;
+	memcpy(&src_tex, target, sizeof(src_tex));
+
+	// Iterate enabled folder shaders
+	HASH_ITER(hh, entries, fe, ftmp) {
+		if (!fe->enabled || !fe->info || !fe->info->backend_shader) {
+			continue;
+		}
+
+		auto sh = (struct gl_shader *)fe->info->backend_shader;
+
+		// Bind the output texture
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gd->temp_fbo);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		                       GL_TEXTURE_2D, target->auxiliary_texture[current], 0);
+		CHECK(gl_check_fb_complete(GL_DRAW_FRAMEBUFFER));
+		glDrawBuffer(GL_COLOR_ATTACHMENT0);
+		glUseProgram(sh->prog);
+		glBlendFunc(GL_ONE, GL_ZERO);
+
+		// Set built-in uniforms (only those that are active in this shader)
+		if (sh->uniform_bitmask) {
+			// We set the most important ones unconditionally via glUniform;
+			// the bitmask check is done in gl_blit_inner's loop but we do it
+			// differently here.
+			glUniform1f(UNIFORM_OPACITY_LOC, 1.0f);
+			glUniform4f(UNIFORM_TINT_LOC, 1.0f, 1.0f, 1.0f, 1.0f);
+			glUniform1f(UNIFORM_DIM_LOC, 0.0f);
+			glUniform1f(UNIFORM_CORNER_RADIUS_LOC, 0.0f);
+			glUniform1f(UNIFORM_BORDER_WIDTH_LOC, 0.0f);
+			glUniform1i(UNIFORM_INVERT_COLOR_LOC, 0);
+			glUniform2f(UNIFORM_EFFECTIVE_SIZE_LOC, (float)w, (float)h);
+			glUniform1f(UNIFORM_MAX_BRIGHTNESS_LOC, 1.0f);
+			glUniform1i(UNIFORM_MASK_INVERTED_LOC, 0);
+			glUniform2f(UNIFORM_MASK_OFFSET_LOC, 0.0f, 0.0f);
+			glUniform1f(UNIFORM_MASK_CORNER_RADIUS_LOC, 0.0f);
+
+			if (sh->uniform_bitmask & (1U << UNIFORM_TIME_LOC)) {
+				glUniform1f(UNIFORM_TIME_LOC, time_ms);
+			}
+		}
+
+		// Bind the default mask texture so mask_factor() returns 1.0, and the
+		// brightness texture so default_post_processing()'s brightness lookup
+		// doesn't read the source/back buffer (which would create a feedback
+		// loop). Masks and brightness-driven dimming are post-process future
+		// features; for now both are bound to a neutral 1x1 texture so they are
+		// no-ops. These must be explicitly bound to dedicated texture units:
+		// sampler uniforms default to 0 (GL_TEXTURE0), which is bound to the
+		// source texture here, so without explicit binding both samplers would
+		// sample the source texture and mask_factor() would multiply the output
+		// by the source's red channel — a multiplicative feedback loop across
+		// frames that fades the screen to black.
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, gd->default_mask_texture);
+		glBindSampler(1, gd->samplers[GL_SAMPLER_REPEAT]);
+		glUniform1i(UNIFORM_MASK_TEX_LOC, 1);
+
+		glActiveTexture(GL_TEXTURE2);
+		glBindTexture(GL_TEXTURE_2D, gd->default_mask_texture);
+		glBindSampler(2, gd->samplers[GL_SAMPLER_EDGE]);
+		glUniform1i(UNIFORM_BRIGHTNESS_LOC, 2);
+
+		// Bind source texture at TEX_LOC
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, src_tex.texture);
+		glBindSampler(0, gd->samplers[GL_SAMPLER_REPEAT]);
+		if (sh->uniform_bitmask & (1U << UNIFORM_TEX_LOC)) {
+			glUniform1i(UNIFORM_TEX_LOC, 0);
+		}
+
+		// Set custom uniforms from state
+		struct shader_input_var *v, *vtmp;
+		HASH_ITER(hh, fe->vars, v, vtmp) {
+			struct shader_state_value *sv = NULL;
+			HASH_FIND_STR(state, v->name, sv);
+			if (!sv) {
+				continue;
+			}
+			switch (v->gl_type) {
+			case GL_FLOAT:
+				if (sv->type == SU_FLOAT) {
+					glUniform1f(v->location, sv->f);
+				}
+				break;
+			case GL_INT:
+			case GL_BOOL:
+				if (sv->type == SU_INT || sv->type == SU_BOOL) {
+					glUniform1i(v->location, sv->i);
+				}
+				break;
+			case GL_FLOAT_VEC2:
+				if (sv->type == SU_VEC2) {
+					glUniform2f(v->location, sv->v[0], sv->v[1]);
+				}
+				break;
+			case GL_FLOAT_VEC3:
+				if (sv->type == SU_VEC3) {
+					glUniform3f(v->location, sv->v[0], sv->v[1],
+					            sv->v[2]);
+				}
+				break;
+			case GL_FLOAT_VEC4:
+				if (sv->type == SU_VEC4) {
+					glUniform4f(v->location, sv->v[0], sv->v[1],
+					            sv->v[2], sv->v[3]);
+				}
+				break;
+			default:
+				break;
+			}
+		}
+
+		// Render the quad
+		glBindVertexArray(gd->vertex_array_objects[0]);
+		glBindBuffer(GL_ARRAY_BUFFER, gd->buffer_objects[0]);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gd->buffer_objects[1]);
+		glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(GLfloat), coord, GL_STREAM_DRAW);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, 6 * sizeof(GLuint), indices,
+		             GL_STREAM_DRAW);
+		{
+			int stride = 4 * (int)sizeof(GLfloat);
+			glEnableVertexAttribArray(vert_coord_loc);
+			glVertexAttribPointer(vert_coord_loc, 2, GL_FLOAT, GL_FALSE,
+			                      stride, NULL);
+			glEnableVertexAttribArray(vert_in_texcoord_loc);
+			glVertexAttribPointer(vert_in_texcoord_loc, 2, GL_FLOAT, GL_FALSE,
+			                      stride, (void *)(2 * sizeof(GLfloat)));
+		}
+		glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, NULL);
+		glDisableVertexAttribArray(vert_coord_loc);
+		glDisableVertexAttribArray(vert_in_texcoord_loc);
+		glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(GLfloat), NULL, GL_STREAM_DRAW);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, 6 * sizeof(GLuint), NULL,
+		             GL_STREAM_DRAW);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+		glBindVertexArray(0);
+		
+
+		// Cleanup texture units
+		glActiveTexture(GL_TEXTURE2);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindSampler(2, 0);
+		glActiveTexture(GL_TEXTURE1);
+		glBindTexture(GL_TEXTURE_2D, 0);
+		glBindSampler(1, 0);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, 0);
+
+		glUseProgram(0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		glDrawBuffer(GL_BACK);
+		gl_check_err();
+
+		// Swap: next iteration uses auxiliary_texture[current] as src
+		src_tex.texture = target->auxiliary_texture[current];
+		current ^= 1;
+	}
+
+	// If the final result is in a ping-pong texture, copy it back to target
+	if (src_tex.texture != target->texture) {
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, gd->temp_fbo);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		                       GL_TEXTURE_2D, target->texture, 0);
+		CHECK(gl_check_fb_complete(GL_DRAW_FRAMEBUFFER));
+		glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, src_tex.texture);
+
+		// Use the copy_area program for the final blit
+		glUseProgram(gd->copy_area_prog.prog);
+		glBlendFunc(GL_ONE, GL_ZERO);
+		glUniform1i(UNIFORM_TEX_LOC, 0);
+
+		// Use the same quad/VAO setup
+		glBindVertexArray(gd->vertex_array_objects[1]);
+		glBindBuffer(GL_ARRAY_BUFFER, gd->buffer_objects[2]);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gd->buffer_objects[3]);
+		glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(GLfloat), coord, GL_STREAM_DRAW);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, 6 * sizeof(GLuint), indices,
+		             GL_STREAM_DRAW);
+		glEnableVertexAttribArray(vert_coord_loc);
+		glVertexAttribPointer(vert_coord_loc, 2, GL_FLOAT, GL_FALSE,
+		                      4 * (int)sizeof(GLfloat), NULL);
+		glEnableVertexAttribArray(vert_in_texcoord_loc);
+		glVertexAttribPointer(vert_in_texcoord_loc, 2, GL_FLOAT, GL_FALSE,
+		                      4 * (int)sizeof(GLfloat), (void *)(2 * sizeof(GLfloat)));
+		glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, NULL);
+		glDisableVertexAttribArray(vert_coord_loc);
+		glDisableVertexAttribArray(vert_in_texcoord_loc);
+		glBufferData(GL_ARRAY_BUFFER, 16 * sizeof(GLfloat), NULL, GL_STREAM_DRAW);
+		glBufferData(GL_ELEMENT_ARRAY_BUFFER, 6 * sizeof(GLuint), NULL,
+		             GL_STREAM_DRAW);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+		glBindVertexArray(0);
+
+		glUseProgram(0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
+		glDrawBuffer(GL_BACK);
+		gl_check_err();
+	}
+
+	free(coord);
+	free(indices);
 }
 
 struct glsl_parse_state {

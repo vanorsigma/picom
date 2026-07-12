@@ -15,6 +15,8 @@
 
 typedef pixman_region32_t region_t;
 struct shader_specification;
+struct shader_folder_entry;
+struct shader_state_value;
 
 struct xvisual_info {
 	/// Bit depth of the red component
@@ -332,6 +334,13 @@ struct backend_operations {
 	/// track of the region of the back buffer that has been updated, and use relevant
 	/// mechanism (when possible) to present only the updated region.
 	bool (*present)(struct backend_base *backend_data) __attribute__((nonnull(1)));
+
+	/// Apply display-wide post-processing shaders to the composited output.
+	/// Optional; when NULL the backend does not support post-processing.
+	void (*post_process)(struct backend_base *backend_data, image_handle target,
+	                     ivec2 size, const region_t *damage,
+	                     struct shader_folder_entry *entries,
+	                     struct shader_state_value *state);
 
 	// ============ Resource management ===========
 

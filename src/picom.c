@@ -15,6 +15,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <ev.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <libgen.h>
@@ -48,6 +49,7 @@
 #include "compiler.h"
 #include "config.h"
 #include "dbus.h"
+#include "server.h"
 #include "diagnostic.h"
 #include "event.h"
 #include "inspect.h"
@@ -568,6 +570,21 @@ static bool initialize_backend(session_t *ps) {
 				          shader_spec_get_path(shader->spec),
 				          shader->attributes);
 			}
+		}
+
+		// Discover custom uniforms for folder shaders
+		struct shader_folder_entry *fe, *fetmp;
+		HASH_ITER(hh, ps->shader_folder_entries, fe, fetmp) {
+			if (!fe->info->backend_shader) {
+				continue;
+			}
+#ifdef CONFIG_OPENGL
+			extern void gl_collect_custom_uniforms(
+			    void *, struct shader_input_var **);
+			gl_collect_custom_uniforms(
+			    (void *)fe->info->backend_shader,
+			    &fe->vars);
+#endif
 		}
 	}
 
@@ -1878,6 +1895,64 @@ load_shader_source(session_t *ps, const struct shader_specification *spec) {
 	return shader;
 }
 
+/// Load all .glsl / .frag files from a directory as folder shaders
+static bool load_shader_folder(session_t *ps, const char *dir_path) {
+	if (!dir_path || !dir_path[0]) {
+		return true;
+	}
+	DIR *dir = opendir(dir_path);
+	if (!dir) {
+		log_error("Failed to open shader directory \"%s\": %s",
+		          dir_path, strerror(errno));
+		return false;
+	}
+
+	struct dirent *entry;
+	unsigned count = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		const char *name = entry->d_name;
+		size_t nlen = strlen(name);
+
+		// Only process .glsl and .frag files
+		if ((nlen < 5 || strcmp(name + nlen - 5, ".glsl") != 0) &&
+		    (nlen < 5 || strcmp(name + nlen - 5, ".frag") != 0)) {
+			continue;
+		}
+
+		// Derive shader name from filename (strip extension)
+		size_t baselen = nlen - 5;
+		// Check shader name isn't empty
+		if (baselen == 0) {
+			continue;
+		}
+
+		// Build full path
+		scoped_charp full_path = ccalloc(strlen(dir_path) + 1 + nlen + 1, char);
+		sprintf(full_path, "%s/%s", dir_path, name);
+
+		// Load source (reuses existing cache)
+		struct shader_specification *spec = shader_spec_from_path(full_path);
+		struct shader_info *info = load_shader_source(ps, spec);
+		if (!info) {
+			log_error("Failed to load folder shader: %s", full_path);
+			free(spec);
+			continue;
+		}
+
+		// Create the folder entry (enabled = false by default)
+		auto fe = ccalloc(1, struct shader_folder_entry);
+		fe->name = strndup(name, baselen);
+		fe->info = info;
+		fe->enabled = false;
+		fe->order = count++;
+		HASH_ADD_STR(ps->shader_folder_entries, name, fe);
+
+		log_info("Loaded folder shader: \"%s\" from %s", fe->name, full_path);
+	}
+	closedir(dir);
+	return true;
+}
+
 static struct window_options win_options_from_config(const struct options *opts) {
 	struct window_options ret = {
 	    .blur_background = opts->blur_method != BLUR_METHOD_NONE,
@@ -2122,6 +2197,13 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 		}
 	}
 
+	// Load folder shaders from directory
+	if (ps->o.shader_directory) {
+		if (!load_shader_folder(ps, ps->o.shader_directory)) {
+			log_error("Failed to load shader folder, continuing");
+		}
+	}
+
 	if (log_get_level_tls() <= LOG_LEVEL_DEBUG) {
 		HASH_ITER2(ps->shaders, shader) {
 			log_debug("Shader %s:", shader_spec_get_path(shader->spec));
@@ -2250,6 +2332,13 @@ static session_t *session_init(int argc, char **argv, Display *dpy,
 		exit(1);
 #endif
 	}
+
+	// Initialize the shader control server
+#ifdef CONFIG_SERVER
+	ps->shader_server = server_init(ps);
+#else
+	(void)0;
+#endif
 
 	ps->wm = wm_new();
 	wm_import_start(ps->wm, &ps->c, ps->atoms, ps->c.screen_info->root, NULL);
@@ -2382,6 +2471,12 @@ static void session_destroy(session_t *ps) {
 	}
 #endif
 
+#ifdef CONFIG_SERVER
+	// Kill shader server
+	server_destroy(ps, ps->shader_server);
+	ps->shader_server = NULL;
+#endif
+
 	wm_stack_foreach(ps->wm, cursor) {
 		auto w = wm_ref_deref(cursor);
 		if (w != NULL) {
@@ -2410,6 +2505,34 @@ static void session_destroy(session_t *ps) {
 		HASH_DEL(ps->shader_sources, source);
 		free((void *)source->source);
 		free(source);
+	}
+
+	// Free folder shader entries
+	{
+		struct shader_folder_entry *fe, *fetmp;
+		HASH_ITER(hh, ps->shader_folder_entries, fe, fetmp) {
+			HASH_DEL(ps->shader_folder_entries, fe);
+			free(fe->name);
+			if (fe->vars) {
+				struct shader_input_var *v, *vtmp;
+				HASH_ITER(hh, fe->vars, v, vtmp) {
+					HASH_DEL(fe->vars, v);
+					free(v->name);
+					free(v);
+				}
+			}
+			free(fe);
+		}
+	}
+
+	// Free shader state
+	{
+		struct shader_state_value *sv, *svtmp;
+		HASH_ITER(hh, ps->shader_state, sv, svtmp) {
+			HASH_DEL(ps->shader_state, sv);
+			free(sv->key);
+			free(sv);
+		}
 	}
 
 	// Release overlay window

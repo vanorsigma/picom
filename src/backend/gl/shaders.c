@@ -8,7 +8,7 @@ const char copy_area_frag[] = GLSL(330,
 	in vec2 texcoord;
 	void main() {
 		vec2 texsize = textureSize(tex, 0);
-		gl_FragColor = texture2D(tex, texcoord / texsize, 0);
+		gl_FragColor = texture2D(tex, texcoord / texsize);
 	}
 );
 

@@ -99,6 +99,11 @@ if get_option('dbus')
 	srcs += ['dbus.c', 'rtkit.c']
 endif
 
+if get_option('server')
+	cflags += ['-DCONFIG_SERVER']
+	srcs += ['server.c']
+endif
+
 if get_option('unittest')
 	cflags += ['-DUNIT_TEST']
 endif
