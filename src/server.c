@@ -33,6 +33,7 @@ struct client_connection {
 	char out_buf[MAX_RSP_LEN];
 	size_t out_len;
 	size_t out_sent;
+	bool close_after_write;
 	struct client_connection *next;
 	struct server_data *sd;
 };
@@ -302,8 +303,21 @@ static void client_read_cb(EV_P_ ev_io *w, int revents attr_unused) {
 	auto cc = container_of(w, struct client_connection, read_watcher);
 	char buf[4096];
 	ssize_t n = read(cc->fd, buf, sizeof(buf));
-	if (n <= 0) {
+	if (n < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK) {
+			return;
+		}
 		close_client(cc);
+		return;
+	}
+	if (n == 0) {
+		// A client such as `nc -N` half-closes after sending its command. Keep
+		// the connection alive until the queued response has been written.
+		cc->close_after_write = true;
+		ev_io_stop(EV_A_ &cc->read_watcher);
+		if (cc->out_len == cc->out_sent) {
+			close_client(cc);
+		}
 		return;
 	}
 
@@ -329,6 +343,10 @@ static void client_write_cb(EV_P_ ev_io *w, int revents attr_unused) {
 	auto cc = container_of(w, struct client_connection, write_watcher);
 	if (cc->out_sent >= cc->out_len) {
 		ev_io_stop(EV_A_ w);
+		if (cc->close_after_write) {
+			close_client(cc);
+			return;
+		}
 		cc->out_len = 0;
 		cc->out_sent = 0;
 		return;
@@ -345,6 +363,10 @@ static void client_write_cb(EV_P_ ev_io *w, int revents attr_unused) {
 	cc->out_sent += (size_t)n;
 	if (cc->out_sent >= cc->out_len) {
 		ev_io_stop(EV_A_ w);
+		if (cc->close_after_write) {
+			close_client(cc);
+			return;
+		}
 		cc->out_len = 0;
 		cc->out_sent = 0;
 	}

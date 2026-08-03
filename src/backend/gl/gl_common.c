@@ -808,15 +808,53 @@ xcb_pixmap_t gl_release_image(backend_t *base, image_handle image) {
 	return pixmap;
 }
 
+static int gl_builtin_uniform_location(const char *name) {
+	static const struct {
+		const char *name;
+		int location;
+	} builtins[] = {
+		{"opacity", UNIFORM_OPACITY_LOC},
+		{"invert_color", UNIFORM_INVERT_COLOR_LOC},
+		{"tex", UNIFORM_TEX_LOC},
+		{"effective_size", UNIFORM_EFFECTIVE_SIZE_LOC},
+		{"dim", UNIFORM_DIM_LOC},
+		{"brightness", UNIFORM_BRIGHTNESS_LOC},
+		{"max_brightness", UNIFORM_MAX_BRIGHTNESS_LOC},
+		{"corner_radius", UNIFORM_CORNER_RADIUS_LOC},
+		{"border_width", UNIFORM_BORDER_WIDTH_LOC},
+		{"time", UNIFORM_TIME_LOC},
+		{"color", UNIFORM_COLOR_LOC},
+		{"pixel_norm", UNIFORM_PIXEL_NORM_LOC},
+		{"tex_src", UNIFORM_TEX_SRC_LOC},
+		{"mask_tex", UNIFORM_MASK_TEX_LOC},
+		{"mask_offset", UNIFORM_MASK_OFFSET_LOC},
+		{"mask_corner_radius", UNIFORM_MASK_CORNER_RADIUS_LOC},
+		{"mask_inverted", UNIFORM_MASK_INVERTED_LOC},
+		{"scale", UNIFORM_SCALE_LOC},
+		{"projection", UNIFORM_PROJECTION_LOC},
+		{"texsize", UNIFORM_TEXSIZE_LOC},
+		{"tint", UNIFORM_TINT_LOC},
+		{"mask_scale", UNIFORM_MASK_SCALE_LOC},
+		{"noise_radius", UNIFORM_BLUR_NOISE_RADIUS_LOC},
+		{"noise_scale", UNIFORM_BLUR_NOISE_SCALE_LOC},
+	};
+
+	for (size_t i = 0; i < ARR_SIZE(builtins); i++) {
+		if (strcmp(name, builtins[i].name) == 0) {
+			return builtins[i].location;
+		}
+	}
+	return -1;
+}
+
 static inline void gl_init_uniform_bitmask(struct gl_shader *shader) {
 	GLint number_of_uniforms = 0;
 	glGetProgramiv(shader->prog, GL_ACTIVE_UNIFORMS, &number_of_uniforms);
 	for (int i = 0; i < number_of_uniforms; i++) {
 		char name[32];
 		glGetActiveUniformName(shader->prog, (GLuint)i, sizeof(name), NULL, name);
-		GLint loc = glGetUniformLocation(shader->prog, name);
-		assert(loc >= 0);
-		if (loc < NUMBER_OF_UNIFORMS) {
+		int loc = gl_builtin_uniform_location(name);
+		if (loc >= 0) {
 			shader->uniform_bitmask |= 1U << loc;
 		}
 	}
@@ -831,9 +869,12 @@ void gl_collect_custom_uniforms(struct gl_shader *sh, struct shader_input_var **
 		GLenum type;
 		GLint size;
 		glGetActiveUniform(sh->prog, (GLuint)i, sizeof(name), &len, &size, &type, name);
-		GLint loc = glGetUniformLocation(sh->prog, name);
-		if (loc < NUMBER_OF_UNIFORMS) {
+		if (gl_builtin_uniform_location(name) >= 0) {
 			continue; // built-in, skip
+		}
+		GLint loc = glGetUniformLocation(sh->prog, name);
+		if (loc < 0) {
+			continue;
 		}
 		// Strip array suffix "[0]" if present
 		char *array_suffix = strstr(name, "[0]");
