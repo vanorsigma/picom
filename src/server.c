@@ -351,8 +351,8 @@ static void client_write_cb(EV_P_ ev_io *w, int revents attr_unused) {
 		cc->out_sent = 0;
 		return;
 	}
-	ssize_t n = write(cc->fd, cc->out_buf + cc->out_sent,
-	                  cc->out_len - cc->out_sent);
+	ssize_t n = send(cc->fd, cc->out_buf + cc->out_sent,
+	                 cc->out_len - cc->out_sent, MSG_NOSIGNAL);
 	if (n < 0) {
 		if (errno == EAGAIN || errno == EWOULDBLOCK) {
 			return;
