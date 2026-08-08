@@ -202,6 +202,38 @@ static void cmd_disable(struct server_data *sd, struct client_connection *cc,
 	send_response(cc, "OK\n");
 }
 
+static void cmd_clearstate(struct server_data *sd, struct client_connection *cc,
+                           int argc, char **argv) {
+	if (argc < 1) {
+		send_response(cc, "ERR usage: CLEARSTATE <shader_name>\n");
+		return;
+	}
+	struct shader_folder_entry *fe = NULL;
+	HASH_FIND_STR(sd->ps->shader_folder_entries, argv[0], fe);
+	if (!fe) {
+		send_response(cc, "ERR shader not found: %s\n", argv[0]);
+		return;
+	}
+	// Reset every input variable this shader uses to zero, so the next
+	// render pass sets the GL uniforms back to their default values.
+	struct shader_input_var *v, *vtmp;
+	HASH_ITER(hh, fe->vars, v, vtmp) {
+		struct shader_state_value *sv = NULL;
+		HASH_FIND_STR(sd->ps->shader_state, v->name, sv);
+		if (!sv) {
+			sv = ccalloc(1, struct shader_state_value);
+			sv->key = strdup(v->name);
+			HASH_ADD_STR(sd->ps->shader_state, key, sv);
+		}
+		sv->type = v->type;
+		sv->f = 0;
+		sv->i = 0;
+		sv->v[0] = sv->v[1] = sv->v[2] = sv->v[3] = 0;
+	}
+	force_repaint(sd->ps);
+	send_response(cc, "OK\n");
+}
+
 static void cmd_list(struct server_data *sd, struct client_connection *cc,
                      int argc attr_unused, char **argv attr_unused) {
 	struct shader_folder_entry *fe, *tmp;
@@ -283,6 +315,8 @@ static void process_line(struct server_data *sd, struct client_connection *cc,
 		cmd_enable(sd, cc, argc - 1, args + 1);
 	} else if (strcmp(args[0], "DISABLE") == 0) {
 		cmd_disable(sd, cc, argc - 1, args + 1);
+	} else if (strcmp(args[0], "CLEARSTATE") == 0) {
+		cmd_clearstate(sd, cc, argc - 1, args + 1);
 	} else if (strcmp(args[0], "LIST") == 0) {
 		cmd_list(sd, cc, argc - 1, args + 1);
 	} else if (strcmp(args[0], "GET") == 0) {
@@ -322,19 +356,25 @@ static void client_read_cb(EV_P_ ev_io *w, int revents attr_unused) {
 	}
 
 	// Append to input buffer and process lines
+	bool overflowing = false;
 	for (ssize_t i = 0; i < n; i++) {
 		char c = buf[i];
 		if (c == '\n') {
-			cc->in_buf[cc->in_len] = '\0';
-			process_line(cc->sd, cc, cc->in_buf);
+			if (!overflowing) {
+				cc->in_buf[cc->in_len] = '\0';
+				process_line(cc->sd, cc, cc->in_buf);
+			}
 			cc->in_len = 0;
-		} else if (cc->in_len < sizeof(cc->in_buf) - 1) {
-			cc->in_buf[cc->in_len++] = c;
-		}
-		// If buffer overflows (without a newline), we just reset
-		if (cc->in_len >= sizeof(cc->in_buf) - 1) {
-			log_warn("Shader server client input buffer overflow, resetting");
-			cc->in_len = 0;
+			overflowing = false;
+		} else if (!overflowing) {
+			if (cc->in_len < sizeof(cc->in_buf) - 1) {
+				cc->in_buf[cc->in_len++] = c;
+			} else {
+				// Line too long: drop the rest of it until the next
+				// newline instead of recycling its tail as a bogus command.
+				log_warn("Shader server client input line too long, dropping");
+				overflowing = true;
+			}
 		}
 	}
 }
