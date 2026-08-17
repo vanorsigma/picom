@@ -93,6 +93,7 @@ struct shader_folder_entry {
 	char *name;
 	struct shader_info *info;
 	struct shader_input_var *vars;
+	struct shader_state_value *local_state;
 	bool enabled;
 	unsigned order;
 	UT_hash_handle hh;

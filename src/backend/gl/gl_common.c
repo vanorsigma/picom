@@ -903,6 +903,18 @@ void gl_collect_custom_uniforms(struct gl_shader *sh, struct shader_input_var **
 	}
 }
 
+static int gl_shader_entry_order_cmp(const void *a, const void *b) {
+	const struct shader_folder_entry *const *ea = a;
+	const struct shader_folder_entry *const *eb = b;
+	if ((*ea)->order < (*eb)->order) {
+		return -1;
+	}
+	if ((*ea)->order > (*eb)->order) {
+		return 1;
+	}
+	return 0;
+}
+
 void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
                      const region_t *damage attr_unused,
                      struct shader_folder_entry *entries,
@@ -913,17 +925,6 @@ void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
 	if (!entries) {
 		return;
 	}
-	bool has_enabled = false;
-	struct shader_folder_entry *fe, *ftmp;
-	HASH_ITER(hh, entries, fe, ftmp) {
-		if (fe->enabled && fe->info && fe->info->backend_shader) {
-			has_enabled = true;
-			break;
-		}
-	}
-	if (!has_enabled) {
-		return;
-	}
 
 	auto target = (struct gl_texture *)target_handle;
 	int w = size.width;
@@ -931,6 +932,31 @@ void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
 	if (w <= 0 || h <= 0) {
 		return;
 	}
+
+	// Collect enabled entries and sort them by load order so the shader stack
+	// runs deterministically in filename order (00-, 01-, 02-, ...) instead of
+	// uthash's hash-bucket order.
+	struct shader_folder_entry *fe, *ftmp;
+	int enabled_count = 0;
+	HASH_ITER(hh, entries, fe, ftmp) {
+		if (fe->enabled && fe->info && fe->info->backend_shader) {
+			enabled_count++;
+		}
+	}
+	if (enabled_count == 0) {
+		return;
+	}
+
+	struct shader_folder_entry **ordered =
+	    ccalloc((size_t)enabled_count, struct shader_folder_entry *);
+	int ordered_idx = 0;
+	HASH_ITER(hh, entries, fe, ftmp) {
+		if (fe->enabled && fe->info && fe->info->backend_shader) {
+			ordered[ordered_idx++] = fe;
+		}
+	}
+	qsort(ordered, (size_t)enabled_count, sizeof(ordered[0]),
+	      gl_shader_entry_order_cmp);
 
 	// Allocate/lookup ping-pong textures on the target image's auxiliary texture
 	// slots. We use auxiliary_texture[0] and [1] as our ping-pong buffers.
@@ -957,10 +983,11 @@ void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
 	GLuint *indices = ccalloc(6, GLuint);
 	gl_mask_rects_to_coords_simple(1, &full_rect, coord, indices);
 
-	// Flip target Y if the target is y-inverted
-	if (target->y_inverted) {
-		gl_y_flip_target(1, coord, (GLint)h);
-	}
+	// The pass loop below renders orientation-preserving copies between
+	// framebuffer textures of identical orientation, so no Y flip is applied
+	// here. Flipping the shared quad would flip the image once per pass plus
+	// once more on the final copy-back (N+1 flips total), turning the screen
+	// upside down for any even number of enabled shaders.
 
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -970,12 +997,9 @@ void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
 	struct gl_texture src_tex;
 	memcpy(&src_tex, target, sizeof(src_tex));
 
-	// Iterate enabled folder shaders
-	HASH_ITER(hh, entries, fe, ftmp) {
-		if (!fe->enabled || !fe->info || !fe->info->backend_shader) {
-			continue;
-		}
-
+	// Iterate enabled folder shaders in sorted order
+	for (int i = 0; i < enabled_count; i++) {
+		fe = ordered[i];
 		auto sh = (struct gl_shader *)fe->info->backend_shader;
 
 		// Bind the output texture
@@ -1038,11 +1062,15 @@ void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
 			glUniform1i(UNIFORM_TEX_LOC, 0);
 		}
 
-		// Set custom uniforms from state
+		// Set custom uniforms from state (shader-local overrides take
+		// precedence over the global shared state)
 		struct shader_input_var *v, *vtmp;
 		HASH_ITER(hh, fe->vars, v, vtmp) {
 			struct shader_state_value *sv = NULL;
-			HASH_FIND_STR(state, v->name, sv);
+			HASH_FIND_STR(fe->local_state, v->name, sv);
+			if (!sv) {
+				HASH_FIND_STR(state, v->name, sv);
+			}
 			if (!sv) {
 				continue;
 			}
@@ -1143,6 +1171,14 @@ void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
 		glBlendFunc(GL_ONE, GL_ZERO);
 		glUniform1i(UNIFORM_TEX_LOC, 0);
 
+		// The pass loop is orientation-preserving. If the final target is not
+		// y-inverted, flip the destination coordinates once on copy-back so the
+		// image matches the target's orientation (no-op for the renderer's
+		// y-inverted back image).
+		if (!target->y_inverted) {
+			gl_y_flip_target(1, coord, (GLint)h);
+		}
+
 		// Use the same quad/VAO setup
 		glBindVertexArray(gd->vertex_array_objects[1]);
 		glBindBuffer(GL_ARRAY_BUFFER, gd->buffer_objects[2]);
@@ -1172,6 +1208,7 @@ void gl_post_process(backend_t *base, image_handle target_handle, ivec2 size,
 		gl_check_err();
 	}
 
+	free(ordered);
 	free(coord);
 	free(indices);
 }

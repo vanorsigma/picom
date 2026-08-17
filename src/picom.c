@@ -1896,6 +1896,12 @@ load_shader_source(session_t *ps, const struct shader_specification *spec) {
 }
 
 /// Load all .glsl / .frag files from a directory as folder shaders
+static int shader_folder_name_cmp(const void *a, const void *b) {
+	const char *const *sa = a;
+	const char *const *sb = b;
+	return strcmp(*sa, *sb);
+}
+
 static bool load_shader_folder(session_t *ps, const char *dir_path) {
 	if (!dir_path || !dir_path[0]) {
 		return true;
@@ -1907,8 +1913,12 @@ static bool load_shader_folder(session_t *ps, const char *dir_path) {
 		return false;
 	}
 
+	// Collect matching file names, then sort them so the shader stack runs in
+	// filename order (00-, 01-, 02-, ...). readdir() order is filesystem
+	// dependent, so relying on it would make the stack order non-deterministic.
 	struct dirent *entry;
-	unsigned count = 0;
+	char **names = NULL;
+	size_t nnames = 0;
 	while ((entry = readdir(dir)) != NULL) {
 		const char *name = entry->d_name;
 		size_t nlen = strlen(name);
@@ -1918,13 +1928,24 @@ static bool load_shader_folder(session_t *ps, const char *dir_path) {
 		    (nlen < 5 || strcmp(name + nlen - 5, ".frag") != 0)) {
 			continue;
 		}
+		// Check shader name isn't empty
+		if (nlen == 5) {
+			continue;
+		}
+		names = crealloc(names, (nnames + 1) * sizeof(*names));
+		names[nnames++] = strdup(name);
+	}
+	closedir(dir);
+
+	qsort(names, nnames, sizeof(names[0]), shader_folder_name_cmp);
+
+	unsigned count = 0;
+	for (size_t i = 0; i < nnames; i++) {
+		const char *name = names[i];
+		size_t nlen = strlen(name);
 
 		// Derive shader name from filename (strip extension)
 		size_t baselen = nlen - 5;
-		// Check shader name isn't empty
-		if (baselen == 0) {
-			continue;
-		}
 
 		// Build full path
 		scoped_charp full_path = ccalloc(strlen(dir_path) + 1 + nlen + 1, char);
@@ -1936,6 +1957,7 @@ static bool load_shader_folder(session_t *ps, const char *dir_path) {
 		if (!info) {
 			log_error("Failed to load folder shader: %s", full_path);
 			free(spec);
+			free(names[i]);
 			continue;
 		}
 
@@ -1948,8 +1970,9 @@ static bool load_shader_folder(session_t *ps, const char *dir_path) {
 		HASH_ADD_STR(ps->shader_folder_entries, name, fe);
 
 		log_info("Loaded folder shader: \"%s\" from %s", fe->name, full_path);
+		free(names[i]);
 	}
-	closedir(dir);
+	free(names);
 	return true;
 }
 
@@ -2519,6 +2542,14 @@ static void session_destroy(session_t *ps) {
 					HASH_DEL(fe->vars, v);
 					free(v->name);
 					free(v);
+				}
+			}
+			if (fe->local_state) {
+				struct shader_state_value *sv, *svtmp;
+				HASH_ITER(hh, fe->local_state, sv, svtmp) {
+					HASH_DEL(fe->local_state, sv);
+					free(sv->key);
+					free(sv);
 				}
 			}
 			free(fe);

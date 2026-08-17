@@ -84,6 +84,46 @@ static void close_client(struct client_connection *cc) {
 
 // ── command parsing and execution ─────────────────────────────────────────────
 
+/// Resolve a possibly shader-scoped uniform key of the form "shader.var" (or
+/// "shader.with.dots.var") into a shader folder entry and the bare uniform name.
+/// Returns the shader entry if the key has a known shader scope, otherwise NULL
+/// (in which case *var_out is left unset). The longest matching shader-name
+/// prefix wins, so shader names may themselves contain dots.
+static struct shader_folder_entry *resolve_scoped_key(session_t *ps, const char *key,
+                                                      const char **var_out) {
+	struct shader_folder_entry *best_fe = NULL;
+	const char *best_var = NULL;
+	for (const char *dot = strchr(key, '.'); dot; dot = strchr(dot + 1, '.')) {
+		size_t shader_len = (size_t)(dot - key);
+		if (shader_len == 0) {
+			continue;
+		}
+		char *shader_name = ccalloc(shader_len + 1, char);
+		memcpy(shader_name, key, shader_len);
+		struct shader_folder_entry *fe = NULL;
+		HASH_FIND_STR(ps->shader_folder_entries, shader_name, fe);
+		free(shader_name);
+		if (fe) {
+			best_fe = fe;
+			best_var = dot + 1;
+		}
+	}
+	*var_out = best_var;
+	return best_fe;
+}
+
+static int shader_entry_order_cmp(const void *a, const void *b) {
+	const struct shader_folder_entry *const *ea = a;
+	const struct shader_folder_entry *const *eb = b;
+	if ((*ea)->order < (*eb)->order) {
+		return -1;
+	}
+	if ((*ea)->order > (*eb)->order) {
+		return 1;
+	}
+	return 0;
+}
+
 static void cmd_set(struct server_data *sd, struct client_connection *cc,
                     int argc, char **argv) {
 	if (argc < 3) {
@@ -122,13 +162,28 @@ static void cmd_set(struct server_data *sd, struct client_connection *cc,
 		return;
 	}
 
-	// Build the state value
+	// Build the state value, scoping it to a shader when the key is of the form
+	// "shader.var". A key containing a '.' but no known shader is an error.
+	bool has_dot = (strchr(key, '.') != NULL);
+	const char *var_name = NULL;
+	struct shader_folder_entry *fe = resolve_scoped_key(sd->ps, key, &var_name);
+	if (has_dot && !fe) {
+		send_response(cc, "ERR unknown shader in key: %s\n", key);
+		return;
+	}
+	struct shader_state_value **target_state = &sd->ps->shader_state;
+	const char *state_key = key;
+	if (fe) {
+		target_state = &fe->local_state;
+		state_key = var_name;
+	}
+
 	struct shader_state_value *sv = NULL;
-	HASH_FIND_STR(sd->ps->shader_state, key, sv);
+	HASH_FIND_STR(*target_state, state_key, sv);
 	if (!sv) {
 		sv = ccalloc(1, struct shader_state_value);
-		sv->key = strdup(key);
-		HASH_ADD_STR(sd->ps->shader_state, key, sv);
+		sv->key = strdup(state_key);
+		HASH_ADD_STR(*target_state, key, sv);
 	}
 	sv->type = type;
 	for (int i = 0; i < needed; i++) {
@@ -151,18 +206,60 @@ static void cmd_set(struct server_data *sd, struct client_connection *cc,
 	send_response(cc, "OK\n");
 }
 
+/// Write an explicit zero into a shader's local state for a variable that
+/// otherwise has no value. GL uniform values persist in the program object, so
+/// after deleting an override the last written value would otherwise stay in
+/// effect. Only applied when there is no global fallback (which the render path
+/// would use instead).
+static void zero_var_local_if_no_global(session_t *ps, struct shader_folder_entry *fe,
+                                        struct shader_input_var *v) {
+	struct shader_state_value *gsv = NULL;
+	HASH_FIND_STR(ps->shader_state, v->name, gsv);
+	if (gsv) {
+		return;
+	}
+	struct shader_state_value *sv = NULL;
+	HASH_FIND_STR(fe->local_state, v->name, sv);
+	if (sv) {
+		return;
+	}
+	sv = ccalloc(1, struct shader_state_value);
+	sv->key = strdup(v->name);
+	sv->type = v->type;
+	HASH_ADD_STR(fe->local_state, key, sv);
+}
+
 static void cmd_del(struct server_data *sd, struct client_connection *cc,
                     int argc, char **argv) {
 	if (argc < 1) {
 		send_response(cc, "ERR usage: DEL <key>\n");
 		return;
 	}
+	const char *var_name = NULL;
+	struct shader_folder_entry *fe = resolve_scoped_key(sd->ps, argv[0], &var_name);
+	struct shader_state_value **target_state = &sd->ps->shader_state;
+	const char *state_key = argv[0];
+	if (fe) {
+		target_state = &fe->local_state;
+		state_key = var_name;
+	}
 	struct shader_state_value *sv = NULL;
-	HASH_FIND_STR(sd->ps->shader_state, argv[0], sv);
+	HASH_FIND_STR(*target_state, state_key, sv);
 	if (sv) {
-		HASH_DEL(sd->ps->shader_state, sv);
+		HASH_DEL(*target_state, sv);
 		free(sv->key);
 		free(sv);
+		force_repaint(sd->ps);
+	}
+	if (fe) {
+		// Removing a shader-local override leaves the GL uniform holding its
+		// last written value, so reset it locally when nothing else would set
+		// it (same reasoning as CLEARSTATE).
+		struct shader_input_var *v = NULL;
+		HASH_FIND_STR(fe->vars, var_name, v);
+		if (v) {
+			zero_var_local_if_no_global(sd->ps, fe, v);
+		}
 		force_repaint(sd->ps);
 	}
 	send_response(cc, "OK\n");
@@ -214,21 +311,21 @@ static void cmd_clearstate(struct server_data *sd, struct client_connection *cc,
 		send_response(cc, "ERR shader not found: %s\n", argv[0]);
 		return;
 	}
-	// Reset every input variable this shader uses to zero, so the next
-	// render pass sets the GL uniforms back to their default values.
+	// Remove the shader's local uniform overrides, then explicitly zero every
+	// input variable that has no global value. This guarantees the GL uniforms
+	// are actually rewritten next frame; uniform values persist in the program
+	// object, so merely deleting the override would leave the last written
+	// value in effect (e.g. a mid-animation cut would never reset). Global
+	// shared state and other shaders are left untouched.
+	struct shader_state_value *sv, *svtmp;
+	HASH_ITER(hh, fe->local_state, sv, svtmp) {
+		HASH_DEL(fe->local_state, sv);
+		free(sv->key);
+		free(sv);
+	}
 	struct shader_input_var *v, *vtmp;
 	HASH_ITER(hh, fe->vars, v, vtmp) {
-		struct shader_state_value *sv = NULL;
-		HASH_FIND_STR(sd->ps->shader_state, v->name, sv);
-		if (!sv) {
-			sv = ccalloc(1, struct shader_state_value);
-			sv->key = strdup(v->name);
-			HASH_ADD_STR(sd->ps->shader_state, key, sv);
-		}
-		sv->type = v->type;
-		sv->f = 0;
-		sv->i = 0;
-		sv->v[0] = sv->v[1] = sv->v[2] = sv->v[3] = 0;
+		zero_var_local_if_no_global(sd->ps, fe, v);
 	}
 	force_repaint(sd->ps);
 	send_response(cc, "OK\n");
@@ -236,8 +333,17 @@ static void cmd_clearstate(struct server_data *sd, struct client_connection *cc,
 
 static void cmd_list(struct server_data *sd, struct client_connection *cc,
                      int argc attr_unused, char **argv attr_unused) {
+	unsigned count = HASH_COUNT(sd->ps->shader_folder_entries);
+	struct shader_folder_entry **arr =
+	    ccalloc((size_t)(count > 0 ? count : 1), struct shader_folder_entry *);
+	unsigned i = 0;
 	struct shader_folder_entry *fe, *tmp;
 	HASH_ITER(hh, sd->ps->shader_folder_entries, fe, tmp) {
+		arr[i++] = fe;
+	}
+	qsort(arr, (size_t)count, sizeof(arr[0]), shader_entry_order_cmp);
+	for (i = 0; i < count; i++) {
+		fe = arr[i];
 		const char *status = fe->enabled ? "enabled" : "disabled";
 		send_response(cc, "%s %s\n", fe->name, status);
 		if (fe->info && fe->vars) {
@@ -248,6 +354,7 @@ static void cmd_list(struct server_data *sd, struct client_connection *cc,
 			}
 		}
 	}
+	free(arr);
 	send_response(cc, ".\n");
 }
 
@@ -257,8 +364,18 @@ static void cmd_get(struct server_data *sd, struct client_connection *cc,
 		send_response(cc, "ERR usage: GET <key>\n");
 		return;
 	}
+	const char *var_name = NULL;
+	struct shader_folder_entry *fe = resolve_scoped_key(sd->ps, argv[0], &var_name);
 	struct shader_state_value *sv = NULL;
-	HASH_FIND_STR(sd->ps->shader_state, argv[0], sv);
+	if (fe) {
+		// Scoped: prefer the shader-local override, then fall back to the
+		// global shared state (matching the render path).
+		HASH_FIND_STR(fe->local_state, var_name, sv);
+	}
+	if (!sv) {
+		const char *global_key = fe ? var_name : argv[0];
+		HASH_FIND_STR(sd->ps->shader_state, global_key, sv);
+	}
 	if (!sv) {
 		send_response(cc, "NOTFOUND\n");
 		return;
